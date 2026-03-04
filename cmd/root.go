@@ -10,9 +10,10 @@ import (
 )
 
 var (
-	outputFile string
-	cfgFile    string
-	appConfig  Config
+	outputFile    string
+	cfgFile       string
+	parallelCount int
+	appConfig     Config
 )
 
 // Config holds the application configuration
@@ -23,6 +24,11 @@ type Config struct {
 	// "album" = Album (Artist):\n    Song
 	// "artist" = Artist:\n    Album:\n        Song
 	Format string `json:"format"`
+	// NoMissingText is written to the output file when all files have complete tags.
+	// If empty, no file is created when there are no missing tags.
+	NoMissingText string `json:"no_missing_text"`
+	// ParallelCount is the number of files to check in parallel (default 1)
+	ParallelCount int `json:"parallel_count"`
 }
 
 // DefaultConfig returns the default configuration
@@ -34,7 +40,9 @@ func DefaultConfig() Config {
 			"MUSICBRAINZ_ARTISTID",
 			"genre",
 		},
-		Format: "album",
+		Format:        "album",
+		NoMissingText: "no missing tags found; last checked at %checked_at%",
+		ParallelCount: 1,
 	}
 }
 
@@ -63,6 +71,7 @@ func init() {
 
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: ~/.config/kyoku-check/config.json)")
 	rootCmd.Flags().StringVarP(&outputFile, "output", "o", "missing-tags.txt", "output file for missing tags report")
+	rootCmd.Flags().IntVarP(&parallelCount, "parallel", "p", 0, "number of files to check in parallel (default: from config)")
 }
 
 func Execute() {
@@ -79,6 +88,11 @@ func initConfig() {
 	}
 
 	appConfig = loadConfig(cfgFile)
+
+	// Override parallel count from CLI flag if set
+	if parallelCount > 0 {
+		appConfig.ParallelCount = parallelCount
+	}
 }
 
 // defaultConfigDir returns the default configuration directory

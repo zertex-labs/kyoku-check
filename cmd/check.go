@@ -11,29 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
-)
-
-// Colors
-var (
-	colorPrimary = lipgloss.Color("#7C3AED") // Purple
-	colorSuccess = lipgloss.Color("#10B981") // Green
-	colorMuted   = lipgloss.Color("#6B7280") // Gray
-)
-
-// Styles
-var (
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(colorPrimary)
-	successStyle = lipgloss.NewStyle().Foreground(colorSuccess)
-	mutedStyle   = lipgloss.NewStyle().Foreground(colorMuted)
-)
-
-// Icons
-const (
-	iconCheck = "✓"
+	"github.com/zertex-labs/kyoku-check/ui"
 )
 
 // supportedExtensions are the audio file types we scan
@@ -80,149 +60,6 @@ type Stats struct {
 	Errors        int
 }
 
-// ScanModel is the bubbletea model for the scanning UI
-type ScanModel struct {
-	folder      string
-	spinner     spinner.Model
-	currentFile string
-	stats       Stats
-	done        bool
-	err         error
-	tracks      []TrackInfo // Tracks missing tags
-	mu          sync.Mutex
-	startTime   time.Time
-}
-
-// Messages
-type scanCompleteMsg struct {
-	tracks []TrackInfo
-	stats  Stats
-	err    error
-}
-
-func newScanModel(folder string) *ScanModel {
-	s := spinner.New()
-	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(colorPrimary)
-
-	return &ScanModel{
-		folder:    folder,
-		spinner:   s,
-		startTime: time.Now(),
-	}
-}
-
-func (m *ScanModel) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, m.startScan())
-}
-
-func (m *ScanModel) startScan() tea.Cmd {
-	return func() tea.Msg {
-		var tracks []TrackInfo
-		var stats Stats
-
-		err := filepath.WalkDir(m.folder, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			if d.IsDir() {
-				return nil
-			}
-
-			ext := strings.ToLower(filepath.Ext(path))
-			if !supportedExtensions[ext] {
-				return nil
-			}
-
-			stats.TotalFiles++
-
-			// Update current file being scanned
-			m.mu.Lock()
-			m.currentFile = path
-			m.stats = stats
-			m.mu.Unlock()
-
-			track, err := extractMetadata(path)
-			if err != nil {
-				stats.Errors++
-				return nil
-			}
-
-			if track.HasAllTags(appConfig.Tags) {
-				stats.CompleteFiles++
-			} else {
-				stats.MissingFiles++
-				tracks = append(tracks, track)
-			}
-
-			return nil
-		})
-
-		return scanCompleteMsg{tracks: tracks, stats: stats, err: err}
-	}
-}
-
-func (m *ScanModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
-			return m, tea.Quit
-		}
-
-	case spinner.TickMsg:
-		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
-		return m, cmd
-
-	case scanCompleteMsg:
-		m.done = true
-		m.tracks = msg.tracks
-		m.stats = msg.stats
-		m.err = msg.err
-		return m, tea.Quit
-	}
-
-	return m, nil
-}
-
-func (m *ScanModel) View() string {
-	var b strings.Builder
-
-	// Header
-	b.WriteString(titleStyle.Render("Scanning for music files") + "\n")
-	b.WriteString(mutedStyle.Render(m.folder) + "\n\n")
-
-	if m.done {
-		elapsed := time.Since(m.startTime).Round(time.Millisecond)
-		b.WriteString(successStyle.Render(iconCheck) + " Scan complete in " + elapsed.String() + "\n\n")
-	} else {
-		// Show spinner and current file
-		m.mu.Lock()
-		currentFile := m.currentFile
-		stats := m.stats
-		m.mu.Unlock()
-
-		b.WriteString(m.spinner.View() + " Scanning...\n")
-		if currentFile != "" {
-			// Show just the filename, not full path
-			displayPath := currentFile
-			if rel, err := filepath.Rel(m.folder, currentFile); err == nil {
-				displayPath = rel
-			}
-			// Truncate if too long
-			if len(displayPath) > 60 {
-				displayPath = "..." + displayPath[len(displayPath)-57:]
-			}
-			b.WriteString(mutedStyle.Render("  "+displayPath) + "\n")
-		}
-		b.WriteString("\n")
-		b.WriteString(mutedStyle.Render(fmt.Sprintf("Files scanned: %d", stats.TotalFiles)) + "\n")
-	}
-
-	return b.String()
-}
-
 func runCheck(cmd *cobra.Command, args []string) error {
 	folder := args[0]
 
@@ -250,8 +87,11 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	var stats Stats
 
 	// Try to run with TUI, fall back to simple output if TTY not available
-	model := newScanModel(absFolder)
+	model := ui.NewScanModel(absFolder)
 	p := tea.NewProgram(model)
+
+	// Start the scan in a goroutine
+	go runScanWithUI(absFolder, p)
 
 	finalModel, err := p.Run()
 	if err != nil {
@@ -261,12 +101,26 @@ func runCheck(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	} else {
-		m := finalModel.(*ScanModel)
-		if m.err != nil {
-			return fmt.Errorf("scan error: %w", m.err)
+		m := finalModel.(*ui.ScanModel)
+		if m.IsCancelled() {
+			return fmt.Errorf("scan cancelled")
 		}
-		tracks = m.tracks
-		stats = m.stats
+
+		// Get stats from model
+		stats.TotalFiles, stats.CompleteFiles, stats.MissingFiles, stats.Errors = m.GetStats()
+
+		// Get missing files from model
+		for _, f := range m.GetMissingFiles() {
+			tracks = append(tracks, TrackInfo{
+				Path:   f.Path,
+				Artist: f.Artist,
+				Album:  f.Album,
+				Title:  f.Title,
+				Tags:   make(map[string]string), // We don't have full tags, but have missing list
+			})
+			// Store missing tags for later (hacky but works)
+			tracks[len(tracks)-1].Tags["_MISSING"] = strings.Join(f.MissingTags, ",")
+		}
 	}
 
 	// Sort tracks based on format
@@ -291,9 +145,13 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	// Write output file if there are missing files
+	// Write output file if there are missing files, or if no_missing_text is configured
 	if len(tracks) > 0 {
 		if err := writeReport(tracks, outputFile, appConfig); err != nil {
+			return fmt.Errorf("failed to write report: %w", err)
+		}
+	} else if appConfig.NoMissingText != "" {
+		if err := writeNoMissingReport(outputFile, appConfig.NoMissingText); err != nil {
 			return fmt.Errorf("failed to write report: %w", err)
 		}
 	}
@@ -307,7 +165,7 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Errors:              %d\n", stats.Errors)
 	}
 
-	if len(tracks) > 0 {
+	if len(tracks) > 0 || appConfig.NoMissingText != "" {
 		absPath, _ := filepath.Abs(outputFile)
 		fmt.Printf("\nReport written to: %s\n", absPath)
 	} else {
@@ -317,6 +175,81 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// runScanWithUI runs the scan with UI updates
+func runScanWithUI(folder string, p *tea.Program) {
+	// First, collect all files
+	var files []string
+	filepath.WalkDir(folder, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if supportedExtensions[ext] {
+			files = append(files, path)
+		}
+		return nil
+	})
+
+	// Send total count
+	p.Send(ui.FileFoundMsg{Total: len(files)})
+
+	// Process files in parallel
+	parallelCount := appConfig.ParallelCount
+	if parallelCount < 1 {
+		parallelCount = 1
+	}
+
+	// Create worker pool
+	type job struct {
+		index int
+		path  string
+	}
+
+	jobs := make(chan job, len(files))
+	var wg sync.WaitGroup
+
+	// Start workers
+	for w := 0; w < parallelCount; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				// Signal start
+				p.Send(ui.FileStartMsg{Index: j.index})
+
+				// Extract metadata
+				track, err := extractMetadata(j.path)
+				if err != nil {
+					p.Send(ui.FileErrorMsg{Index: j.index, Error: err.Error()})
+					continue
+				}
+
+				// Check for missing tags
+				missingTags := track.MissingTags(appConfig.Tags)
+				p.Send(ui.FileCompleteMsg{
+					Index:       j.index,
+					MissingTags: missingTags,
+					Album:       track.Album,
+					Artist:      track.Artist,
+					Title:       track.Title,
+				})
+			}
+		}()
+	}
+
+	// Send jobs
+	for i, path := range files {
+		jobs <- job{index: i, path: path}
+	}
+	close(jobs)
+
+	// Wait for all workers to finish
+	wg.Wait()
+
+	// Signal completion
+	p.Send(ui.ScanCompleteMsg{})
+}
+
 // runScanSimple runs the scan without TUI (fallback for non-TTY environments)
 func runScanSimple(folder string) ([]TrackInfo, Stats, error) {
 	var tracks []TrackInfo
@@ -324,44 +257,82 @@ func runScanSimple(folder string) ([]TrackInfo, Stats, error) {
 
 	fmt.Printf("Scanning: %s\n", folder)
 
-	err := filepath.WalkDir(folder, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
+	// First collect all files
+	var files []string
+	filepath.WalkDir(folder, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
 			return nil
 		}
-		if d.IsDir() {
-			return nil
-		}
-
 		ext := strings.ToLower(filepath.Ext(path))
-		if !supportedExtensions[ext] {
-			return nil
+		if supportedExtensions[ext] {
+			files = append(files, path)
 		}
-
-		stats.TotalFiles++
-
-		// Show progress
-		rel, _ := filepath.Rel(folder, path)
-		fmt.Printf("\r  Scanning: %-60s", truncateString(rel, 60))
-
-		track, err := extractMetadata(path)
-		if err != nil {
-			stats.Errors++
-			return nil
-		}
-
-		if track.HasAllTags(appConfig.Tags) {
-			stats.CompleteFiles++
-		} else {
-			stats.MissingFiles++
-			tracks = append(tracks, track)
-		}
-
 		return nil
 	})
 
+	stats.TotalFiles = len(files)
+
+	// Process with parallel workers
+	parallelCount := appConfig.ParallelCount
+	if parallelCount < 1 {
+		parallelCount = 1
+	}
+
+	type result struct {
+		track TrackInfo
+		err   error
+	}
+
+	jobs := make(chan string, len(files))
+	results := make(chan result, len(files))
+
+	// Start workers
+	var wg sync.WaitGroup
+	for w := 0; w < parallelCount; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				track, err := extractMetadata(path)
+				results <- result{track: track, err: err}
+			}
+		}()
+	}
+
+	// Send jobs
+	for _, path := range files {
+		jobs <- path
+	}
+	close(jobs)
+
+	// Close results when done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results
+	processed := 0
+	for r := range results {
+		processed++
+		fmt.Printf("\r  Processing: %d/%d files", processed, stats.TotalFiles)
+
+		if r.err != nil {
+			stats.Errors++
+			continue
+		}
+
+		if r.track.HasAllTags(appConfig.Tags) {
+			stats.CompleteFiles++
+		} else {
+			stats.MissingFiles++
+			tracks = append(tracks, r.track)
+		}
+	}
+
 	fmt.Printf("\r%80s\r", "") // Clear the line
 
-	return tracks, stats, err
+	return tracks, stats, nil
 }
 
 func truncateString(s string, maxLen int) string {
@@ -475,7 +446,12 @@ func writeAlbumFormat(writer *bufio.Writer, tracks []TrackInfo, requiredTags []s
 		}
 
 		// Print track with missing tags
-		missingTags := track.MissingTags(requiredTags)
+		var missingTags []string
+		if stored, ok := track.Tags["_MISSING"]; ok && stored != "" {
+			missingTags = strings.Split(stored, ",")
+		} else {
+			missingTags = track.MissingTags(requiredTags)
+		}
 		fmt.Fprintf(writer, "    %s [missing: %s]\n",
 			track.Title, strings.Join(missingTags, ", "))
 	}
@@ -508,8 +484,20 @@ func writeArtistFormat(writer *bufio.Writer, tracks []TrackInfo, requiredTags []
 		}
 
 		// Print track with missing tags
-		missingTags := track.MissingTags(requiredTags)
+		var missingTags []string
+		if stored, ok := track.Tags["_MISSING"]; ok && stored != "" {
+			missingTags = strings.Split(stored, ",")
+		} else {
+			missingTags = track.MissingTags(requiredTags)
+		}
 		fmt.Fprintf(writer, "        %s [missing: %s]\n",
 			track.Title, strings.Join(missingTags, ", "))
 	}
+}
+
+// writeNoMissingReport writes the no_missing_text to the output file
+func writeNoMissingReport(outputPath string, text string) error {
+	// Replace %checked_at% with current timestamp
+	text = strings.ReplaceAll(text, "%checked_at%", time.Now().Format("02-01-2006 15:04"))
+	return os.WriteFile(outputPath, []byte(text+"\n"), 0644)
 }
